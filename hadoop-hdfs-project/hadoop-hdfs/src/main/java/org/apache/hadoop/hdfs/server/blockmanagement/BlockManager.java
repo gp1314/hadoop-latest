@@ -1991,17 +1991,29 @@ public class BlockManager implements BlockStatsMXBean {
         expectedRedundancies;
     boolean corruptedDuringWrite = minReplicationSatisfied &&
         b.isCorruptedDuringWrite();
+
+    int numLiveDataNodes = getDatanodeManager().getNumLiveDataNodes();
+    boolean noAvailableDatanode = !b.getStored().isStriped()
+        && minReplicationSatisfied
+        && numLiveDataNodes > 0
+        && expectedRedundancies == numLiveDataNodes
+        && (numberOfReplicas.liveReplicas()
+            + numberOfReplicas.corruptReplicas()) == numLiveDataNodes;
+
     // case 1: have enough number of usable replicas
     // case 2: corrupted replicas + usable replicas > Replication factor
     // case 3: Block is marked corrupt due to failure while writing. In this
     //         case genstamp will be different than that of valid block.
+    // case 4: All live DataNodes have a replica and the requested redundancy
+    //         equals the number of live DataNodes. Delete the corrupt replica
+    //         so that its DataNode can receive the reconstruction.
     // In all these cases we can delete the replica.
     // In case 3, rbw block will be deleted and valid block can be replicated.
     // Note NN only becomes aware of corrupt blocks when the block report is sent,
     // this means that by default it can take up to 6 hours for a corrupt block to
     // be invalidated, after which the valid block can be replicated.
     if (hasEnoughLiveReplicas || hasMoreCorruptReplicas
-        || corruptedDuringWrite) {
+        || corruptedDuringWrite || noAvailableDatanode) {
       if (b.getStored().isStriped()) {
         // If the block is an EC block, the whole block group is marked
         // corrupted, so if this block is getting deleted, remove the block

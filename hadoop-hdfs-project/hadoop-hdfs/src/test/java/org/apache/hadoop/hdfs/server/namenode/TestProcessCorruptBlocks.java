@@ -35,28 +35,23 @@ import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
 import org.apache.hadoop.hdfs.server.blockmanagement.NumberReplicas;
 import org.apache.hadoop.hdfs.server.datanode.DataNodeTestUtils;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 public class TestProcessCorruptBlocks {
   /**
-   * The corrupt block has to be removed when the number of valid replicas
-   * matches replication factor for the file. In this the above condition is
-   * tested by reducing the replication factor 
-   * The test strategy : 
+   * A corrupt replica must be removed when every live DataNode contains the
+   * block. Removing it makes the DataNode available as a reconstruction target.
+   * The test strategy:
    *   Bring up Cluster with 3 DataNodes
    *   Create a file of replication factor 3 
    *   Corrupt one replica of a block of the file 
-   *   Verify that there are still 2 good replicas and 1 corrupt replica
-   *    (corrupt replica should not be removed since number of good
-   *     replicas (2) is less than replication factor (3))
-   *   Set the replication factor to 2 
-   *   Verify that the corrupt replica is removed. 
-   *     (corrupt replica  should not be removed since number of good
-   *      replicas (2) is equal to replication factor (2))
+   *   Verify that the corrupt replica is removed and replication recovers.
    */
   @Test
-  public void testWhenDecreasingReplication() throws Exception {
+  @Timeout(value = 30)
+  public void testReconstructWhenAllDatanodesContainBlock() throws Exception {
     Configuration conf = new HdfsConfiguration();
     conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY, 1000L);
     conf.set(DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY, Integer.toString(2));
@@ -72,20 +67,11 @@ public class TestProcessCorruptBlocks {
       ExtendedBlock block = DFSTestUtil.getFirstBlock(fs, fileName);
       corruptBlock(cluster, fs, fileName, 0, block);
 
-      DFSTestUtil.waitReplication(fs, fileName, (short) 2);
-
-      assertEquals(2, countReplicas(namesystem, block).liveReplicas());
-      assertEquals(1, countReplicas(namesystem, block).corruptReplicas());
-
-      namesystem.setReplication(fileName.toString(), (short) 2);
-
-      // wait for 3 seconds so that all block reports are processed.
-      try {
-        Thread.sleep(3000);
-      } catch (InterruptedException ignored) {
-      }
-
-      assertEquals(2, countReplicas(namesystem, block).liveReplicas());
+      GenericTestUtils.waitFor(() -> {
+        NumberReplicas replicas = countReplicas(namesystem, block);
+        return replicas.liveReplicas() == 3 && replicas.corruptReplicas() == 0;
+      }, 100, 20_000);
+      assertEquals(3, countReplicas(namesystem, block).liveReplicas());
       assertEquals(0, countReplicas(namesystem, block).corruptReplicas());
 
     } finally {
@@ -111,15 +97,13 @@ public class TestProcessCorruptBlocks {
    * 
    */
   @Test
-  public void testByAddingAnExtraDataNode() throws Exception {
+  public void testReconstructUsingAvailableDatanode() throws Exception {
     Configuration conf = new HdfsConfiguration();
     conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY, 1000L);
     conf.set(DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY, Integer.toString(2));
     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).numDataNodes(4).build();
     FileSystem fs = cluster.getFileSystem();
     final FSNamesystem namesystem = cluster.getNamesystem();
-    DataNodeProperties dnPropsFourth = cluster.stopDataNode(3);
-
     try {
       final Path fileName = new Path("/foo1");
       DFSTestUtil.createFile(fs, fileName, 2, (short) 3, 0L);
@@ -128,14 +112,10 @@ public class TestProcessCorruptBlocks {
       ExtendedBlock block = DFSTestUtil.getFirstBlock(fs, fileName);
       corruptBlock(cluster, fs, fileName, 0, block);
 
-      DFSTestUtil.waitReplication(fs, fileName, (short) 2);
-
-      assertEquals(2, countReplicas(namesystem, block).liveReplicas());
-      assertEquals(1, countReplicas(namesystem, block).corruptReplicas());
-
-      cluster.restartDataNode(dnPropsFourth);
-
-      DFSTestUtil.waitReplication(fs, fileName, (short) 3);
+      GenericTestUtils.waitFor(() -> {
+        NumberReplicas replicas = countReplicas(namesystem, block);
+        return replicas.liveReplicas() == 3 && replicas.corruptReplicas() == 0;
+      }, 100, 20_000);
 
       assertEquals(3, countReplicas(namesystem, block).liveReplicas());
       assertEquals(0, countReplicas(namesystem, block).corruptReplicas());
@@ -162,8 +142,8 @@ public class TestProcessCorruptBlocks {
    *      replicas (1) is equal to replication factor (1))
    */
   @Test
-  @Timeout(value = 20)
-  public void testWithReplicationFactorAsOne() throws Exception {
+  @Timeout(value = 30)
+  public void testDecreaseReplicationAfterReconstruction() throws Exception {
     Configuration conf = new HdfsConfiguration();
     conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY, 1000L);
     conf.set(DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY, Integer.toString(2));
@@ -179,23 +159,15 @@ public class TestProcessCorruptBlocks {
       ExtendedBlock block = DFSTestUtil.getFirstBlock(fs, fileName);
       corruptBlock(cluster, fs, fileName, 0, block);
 
-      DFSTestUtil.waitReplication(fs, fileName, (short) 1);
-
-      assertEquals(1, countReplicas(namesystem, block).liveReplicas());
-      assertEquals(1, countReplicas(namesystem, block).corruptReplicas());
+      GenericTestUtils.waitFor(() -> {
+        NumberReplicas replicas = countReplicas(namesystem, block);
+        return replicas.liveReplicas() == 2 && replicas.corruptReplicas() == 0;
+      }, 100, 20_000);
 
       namesystem.setReplication(fileName.toString(), (short) 1);
 
-      // wait for 3 seconds so that all block reports are processed.
-      for (int i = 0; i < 10; i++) {
-        try {
-          Thread.sleep(1000);
-        } catch (InterruptedException ignored) {
-        }
-        if (countReplicas(namesystem, block).corruptReplicas() == 0) {
-          break;
-        }
-      }
+      GenericTestUtils.waitFor(() -> countReplicas(namesystem, block)
+          .liveReplicas() == 1, 100, 20_000);
 
       assertEquals(1, countReplicas(namesystem, block).liveReplicas());
       assertEquals(0, countReplicas(namesystem, block).corruptReplicas());
